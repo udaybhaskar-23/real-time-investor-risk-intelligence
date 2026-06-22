@@ -48,6 +48,7 @@ st.markdown(
         background-color: #ffffff;
         border: 1px solid #e6eaf0;
         box-shadow: 0px 1px 4px rgba(0,0,0,0.05);
+        min-height: 105px;
     }
 
     .metric-label {
@@ -142,6 +143,9 @@ def load_market_data(tickers, period="1y"):
             except Exception:
                 continue
 
+        if not all_data:
+            return pd.DataFrame()
+
         final_df = pd.concat(all_data, ignore_index=True)
         final_df.columns = [str(col).strip().title().replace(" ", "_") for col in final_df.columns]
 
@@ -150,6 +154,7 @@ def load_market_data(tickers, period="1y"):
 
         final_df = final_df[available_columns].copy()
         final_df["Date"] = pd.to_datetime(final_df["Date"])
+        final_df = final_df.dropna(subset=["Close"])
 
         return final_df
 
@@ -265,6 +270,102 @@ def calculate_risk_score(portfolio_metrics):
     return risk_score, risk_level
 
 
+def calculate_market_signal(benchmark_metrics):
+    """
+    Creates a simple market risk signal using SPY, QQQ, and VIX.
+    """
+    signal_points = 0
+    signal_reasons = []
+
+    spy_row = benchmark_metrics[benchmark_metrics["Ticker"] == "SPY"]
+    qqq_row = benchmark_metrics[benchmark_metrics["Ticker"] == "QQQ"]
+    vix_row = benchmark_metrics[benchmark_metrics["Ticker"] == "^VIX"]
+
+    if not spy_row.empty:
+        spy_20d_return = spy_row.iloc[0]["20D Return"]
+        spy_volatility = spy_row.iloc[0]["20D Volatility"]
+
+        if spy_20d_return < -0.05:
+            signal_points += 30
+            signal_reasons.append("SPY has declined more than 5% over the recent 20-day period.")
+        elif spy_20d_return < 0:
+            signal_points += 15
+            signal_reasons.append("SPY has negative short-term momentum.")
+
+        if spy_volatility > 0.25:
+            signal_points += 20
+            signal_reasons.append("SPY 20-day volatility is elevated.")
+
+    if not qqq_row.empty:
+        qqq_20d_return = qqq_row.iloc[0]["20D Return"]
+
+        if qqq_20d_return < -0.05:
+            signal_points += 20
+            signal_reasons.append("QQQ has declined more than 5% over the recent 20-day period.")
+        elif qqq_20d_return < 0:
+            signal_points += 10
+            signal_reasons.append("QQQ has negative short-term momentum.")
+
+    if not vix_row.empty:
+        latest_vix = vix_row.iloc[0]["Latest Price"]
+
+        if latest_vix >= 30:
+            signal_points += 30
+            signal_reasons.append("VIX is above 30, suggesting elevated market fear.")
+        elif latest_vix >= 20:
+            signal_points += 15
+            signal_reasons.append("VIX is above 20, suggesting cautious market conditions.")
+        else:
+            signal_reasons.append("VIX is below 20, suggesting relatively calmer volatility conditions.")
+
+    signal_points = min(signal_points, 100)
+
+    if signal_points < 30:
+        market_level = "Calm Market"
+    elif signal_points < 65:
+        market_level = "Cautious Market"
+    else:
+        market_level = "High-Risk Market"
+
+    if not signal_reasons:
+        signal_reasons.append("Market signal is based on available benchmark data.")
+
+    return signal_points, market_level, signal_reasons
+
+
+def create_portfolio_index(market_data, weights):
+    """
+    Creates weighted portfolio index to compare against benchmarks.
+    """
+    normalized_weights = normalize_weights(weights)
+
+    returns_pivot = market_data.pivot_table(
+        index="Date",
+        columns="Ticker",
+        values="Daily_Return"
+    ).sort_index()
+
+    available_tickers = [ticker for ticker in normalized_weights.keys() if ticker in returns_pivot.columns]
+
+    if not available_tickers:
+        return pd.DataFrame()
+
+    portfolio_daily_return = pd.Series(0, index=returns_pivot.index, dtype=float)
+
+    for ticker in available_tickers:
+        portfolio_daily_return += returns_pivot[ticker].fillna(0) * normalized_weights[ticker]
+
+    portfolio_index = (1 + portfolio_daily_return).cumprod() * 100
+
+    portfolio_df = pd.DataFrame({
+        "Date": portfolio_index.index,
+        "Ticker": "Portfolio",
+        "Price_Index": portfolio_index.values
+    })
+
+    return portfolio_df
+
+
 def format_percent(value):
     if pd.isna(value):
         return "N/A"
@@ -310,7 +411,28 @@ def risk_message(risk_level, risk_score):
     )
 
 
-def create_recommendations(portfolio_metrics, risk_contribution):
+def market_message(market_level, market_score):
+    if market_level == "High-Risk Market":
+        css_class = "risk-high"
+        message = f"High-Risk Market Signal: Market risk score is {market_score}/100. Benchmarks show elevated volatility or negative momentum."
+    elif market_level == "Cautious Market":
+        css_class = "risk-medium"
+        message = f"Cautious Market Signal: Market risk score is {market_score}/100. Investors should monitor benchmark and volatility signals."
+    else:
+        css_class = "risk-low"
+        message = f"Calm Market Signal: Market risk score is {market_score}/100. Benchmark conditions appear relatively stable."
+
+    st.markdown(
+        f"""
+        <div class="{css_class}">
+            {message}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def create_recommendations(portfolio_metrics, risk_contribution, market_level):
     recommendations = []
 
     if portfolio_metrics["Portfolio Volatility"] > 0.35:
@@ -321,6 +443,11 @@ def create_recommendations(portfolio_metrics, risk_contribution):
 
     if portfolio_metrics["Portfolio 20D Return"] < 0:
         recommendations.append("Recent 20-day return is negative. Watch for continued downside momentum.")
+
+    if market_level == "High-Risk Market":
+        recommendations.append("Market benchmark conditions are currently high-risk. Portfolio risk should be evaluated with extra caution.")
+    elif market_level == "Cautious Market":
+        recommendations.append("Market conditions are cautious. Compare portfolio volatility against SPY and QQQ before making assumptions.")
 
     top_risk_stock = risk_contribution.sort_values("Weighted Volatility", ascending=False).iloc[0]["Ticker"]
     recommendations.append(f"{top_risk_stock} is currently the largest weighted volatility contributor in this portfolio.")
@@ -398,7 +525,7 @@ st.markdown(
     """
     <div class="main-title">📊 Real-Time Investor Risk Intelligence Platform</div>
     <div class="subtitle">
-        Interactive portfolio risk monitoring using latest available market data, volatility analytics, drawdown signals, and investor-focused risk scoring.
+        Interactive portfolio risk monitoring using latest available market data, volatility analytics, benchmark signals, drawdown analysis, and investor-focused risk scoring.
     </div>
     """,
     unsafe_allow_html=True
@@ -408,7 +535,7 @@ st.markdown(
     """
     <div class="section-card">
         <b>Project Purpose:</b> This solution helps investors understand portfolio risk exposure, identify major risk contributors,
-        test downside scenarios, and convert market behavior into a clear risk score.
+        compare portfolio behavior against market benchmarks, test downside scenarios, and convert market behavior into a clear risk score.
         <br><br>
         <b>Disclaimer:</b> This project is for educational and portfolio demonstration purposes only. It is not financial advice.
     </div>
@@ -424,7 +551,10 @@ if not tickers:
     st.warning("Please enter at least one ticker.")
     st.stop()
 
+benchmark_tickers = ["SPY", "QQQ", "^VIX"]
+
 market_data = load_market_data(tickers, period)
+benchmark_data = load_market_data(benchmark_tickers, period)
 
 if market_data.empty:
     st.error("No market data found. Please check the ticker symbols.")
@@ -432,6 +562,7 @@ if market_data.empty:
 
 market_data = add_risk_features(market_data)
 metrics_df = calculate_asset_metrics(market_data)
+
 portfolio_metrics = calculate_portfolio_metrics(metrics_df, weights)
 risk_score, risk_level = calculate_risk_score(portfolio_metrics)
 
@@ -440,6 +571,16 @@ normalized_weights = normalize_weights(weights)
 risk_contribution = metrics_df.copy()
 risk_contribution["Weight"] = risk_contribution["Ticker"].map(normalized_weights)
 risk_contribution["Weighted Volatility"] = risk_contribution["Annualized Volatility"] * risk_contribution["Weight"]
+
+if not benchmark_data.empty:
+    benchmark_data = add_risk_features(benchmark_data)
+    benchmark_metrics = calculate_asset_metrics(benchmark_data)
+    market_score, market_level, market_reasons = calculate_market_signal(benchmark_metrics)
+else:
+    benchmark_metrics = pd.DataFrame()
+    market_score = 0
+    market_level = "Unavailable"
+    market_reasons = ["Benchmark data is currently unavailable."]
 
 
 # ---------------------------------------------------------
@@ -461,7 +602,7 @@ with col3:
 with col4:
     metric_card("Portfolio Volatility", format_percent(portfolio_metrics["Portfolio Volatility"]))
 
-col5, col6, col7 = st.columns(3)
+col5, col6, col7, col8 = st.columns(4)
 
 with col5:
     metric_card("Estimated Max Drawdown", format_percent(portfolio_metrics["Portfolio Drawdown"]))
@@ -472,7 +613,13 @@ with col6:
 with col7:
     metric_card("Tracked Securities", str(len(tickers)))
 
+with col8:
+    metric_card("Market Signal", market_level)
+
 risk_message(risk_level, risk_score)
+
+if market_level != "Unavailable":
+    market_message(market_level, market_score)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -480,8 +627,9 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ---------------------------------------------------------
 # App Tabs
 # ---------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
+        "Market Overview",
         "Portfolio Overview",
         "Risk Contributors",
         "Drawdown Analysis",
@@ -492,10 +640,97 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 
 # ---------------------------------------------------------
-# Tab 1: Portfolio Overview
+# Tab 1: Market Overview
 # ---------------------------------------------------------
 with tab1:
-    st.subheader("Normalized Price Trend")
+    st.subheader("Market Benchmark Indicators")
+
+    st.markdown(
+        """
+        This section gives the portfolio broader market context using SPY as an S&P 500 proxy, QQQ as a technology-heavy Nasdaq 100 proxy, and VIX as a market volatility/fear proxy.
+        """
+    )
+
+    if benchmark_metrics.empty:
+        st.warning("Benchmark data is currently unavailable.")
+    else:
+        benchmark_display = benchmark_metrics[
+            [
+                "Ticker",
+                "Latest Price",
+                "Total Return",
+                "Annualized Volatility",
+                "Max Drawdown",
+                "20D Return",
+                "20D Volatility",
+                "Trend Status"
+            ]
+        ].copy()
+
+        benchmark_display["Latest Price"] = benchmark_display["Latest Price"].map(format_currency)
+        benchmark_display["Total Return"] = benchmark_display["Total Return"].map(format_percent)
+        benchmark_display["Annualized Volatility"] = benchmark_display["Annualized Volatility"].map(format_percent)
+        benchmark_display["Max Drawdown"] = benchmark_display["Max Drawdown"].map(format_percent)
+        benchmark_display["20D Return"] = benchmark_display["20D Return"].map(format_percent)
+        benchmark_display["20D Volatility"] = benchmark_display["20D Volatility"].map(format_percent)
+
+        st.dataframe(benchmark_display, use_container_width=True)
+
+        st.subheader("Market Risk Signal")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            metric_card("Market Risk Score", f"{market_score}/100")
+
+        with col_b:
+            metric_card("Market Risk Level", market_level)
+
+        market_message(market_level, market_score)
+
+        st.markdown("**Why this signal was generated:**")
+        for reason in market_reasons:
+            st.write(f"• {reason}")
+
+        st.subheader("Benchmark Performance Trend")
+
+        benchmark_plot_data = benchmark_data[benchmark_data["Ticker"].isin(["SPY", "QQQ"])].copy()
+
+        fig_benchmark = px.line(
+            benchmark_plot_data,
+            x="Date",
+            y="Price_Index",
+            color="Ticker",
+            title="SPY vs QQQ Indexed Performance"
+        )
+        fig_benchmark.update_layout(yaxis_title="Indexed Price Level", xaxis_title="Date")
+        st.plotly_chart(fig_benchmark, use_container_width=True)
+
+        st.subheader("Portfolio vs Market Benchmarks")
+
+        portfolio_index = create_portfolio_index(market_data, normalized_weights)
+        benchmark_index = benchmark_data[benchmark_data["Ticker"].isin(["SPY", "QQQ"])][
+            ["Date", "Ticker", "Price_Index"]
+        ].copy()
+
+        comparison_data = pd.concat([portfolio_index, benchmark_index], ignore_index=True)
+
+        fig_comparison = px.line(
+            comparison_data,
+            x="Date",
+            y="Price_Index",
+            color="Ticker",
+            title="Portfolio vs SPY and QQQ Indexed Performance"
+        )
+        fig_comparison.update_layout(yaxis_title="Indexed Performance", xaxis_title="Date")
+        st.plotly_chart(fig_comparison, use_container_width=True)
+
+
+# ---------------------------------------------------------
+# Tab 2: Portfolio Overview
+# ---------------------------------------------------------
+with tab2:
+    st.subheader("Normalized Portfolio Holdings Trend")
 
     st.markdown(
         """
@@ -542,9 +777,9 @@ with tab1:
 
 
 # ---------------------------------------------------------
-# Tab 2: Risk Contributors
+# Tab 3: Risk Contributors
 # ---------------------------------------------------------
-with tab2:
+with tab3:
     st.subheader("Weighted Volatility Contribution")
 
     st.markdown(
@@ -573,16 +808,16 @@ with tab2:
 
     st.subheader("Risk Insights")
 
-    recommendations = create_recommendations(portfolio_metrics, risk_contribution)
+    recommendations = create_recommendations(portfolio_metrics, risk_contribution, market_level)
 
     for recommendation in recommendations:
         st.write(f"• {recommendation}")
 
 
 # ---------------------------------------------------------
-# Tab 3: Drawdown Analysis
+# Tab 4: Drawdown Analysis
 # ---------------------------------------------------------
-with tab3:
+with tab4:
     st.subheader("Historical Drawdown by Stock")
 
     st.markdown(
@@ -610,11 +845,27 @@ with tab3:
         f"{format_percent(worst_drawdown['Max Drawdown'])}."
     )
 
+    if not benchmark_metrics.empty:
+        st.subheader("Benchmark Drawdown Context")
+
+        benchmark_drawdown = benchmark_data[benchmark_data["Ticker"].isin(["SPY", "QQQ"])].copy()
+
+        fig_benchmark_drawdown = px.line(
+            benchmark_drawdown,
+            x="Date",
+            y="Drawdown",
+            color="Ticker",
+            title="SPY and QQQ Benchmark Drawdown"
+        )
+        fig_benchmark_drawdown.update_layout(yaxis_title="Drawdown", xaxis_title="Date")
+        fig_benchmark_drawdown.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig_benchmark_drawdown, use_container_width=True)
+
 
 # ---------------------------------------------------------
-# Tab 4: Stress Testing
+# Tab 5: Stress Testing
 # ---------------------------------------------------------
-with tab4:
+with tab5:
     st.subheader("Portfolio Stress Test")
 
     st.markdown(
@@ -667,11 +918,18 @@ with tab4:
 
     st.dataframe(display_shock, use_container_width=True)
 
+    if market_level == "High-Risk Market":
+        st.error("Market benchmark conditions are already high-risk, so stress test results should be reviewed with extra caution.")
+    elif market_level == "Cautious Market":
+        st.warning("Market benchmark conditions are cautious. Consider reviewing stress scenarios under higher shock levels.")
+    else:
+        st.success("Current benchmark signal is relatively calm, but downside scenario testing remains useful.")
+
 
 # ---------------------------------------------------------
-# Tab 5: Data & Downloads
+# Tab 6: Data & Downloads
 # ---------------------------------------------------------
-with tab5:
+with tab6:
     st.subheader("Raw Market Data Preview")
 
     st.markdown(
@@ -682,6 +940,14 @@ with tab5:
 
     latest_rows = market_data.sort_values("Date", ascending=False).head(25)
     st.dataframe(latest_rows, use_container_width=True)
+
+    st.subheader("Benchmark Data Preview")
+
+    if benchmark_data.empty:
+        st.warning("Benchmark data is currently unavailable.")
+    else:
+        latest_benchmark_rows = benchmark_data.sort_values("Date", ascending=False).head(25)
+        st.dataframe(latest_benchmark_rows, use_container_width=True)
 
     st.subheader("Download Metrics")
 
@@ -696,6 +962,16 @@ with tab5:
         file_name="portfolio_risk_metrics.csv",
         mime="text/csv"
     )
+
+    if not benchmark_metrics.empty:
+        benchmark_csv = benchmark_metrics.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Download Benchmark Metrics CSV",
+            data=benchmark_csv,
+            file_name="benchmark_market_metrics.csv",
+            mime="text/csv"
+        )
 
     st.markdown(
         f"""
@@ -712,5 +988,5 @@ with tab5:
 # ---------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Built with Python, Streamlit, Pandas, yfinance, Plotly, and portfolio risk analytics methodology."
+    "Built with Python, Streamlit, Pandas, yfinance, Plotly, benchmark analysis, and portfolio risk analytics methodology."
 )
