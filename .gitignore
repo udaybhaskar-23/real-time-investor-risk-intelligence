@@ -5,7 +5,10 @@ __pycache__/
 .streamlit/secrets.toml
 .DS_Store
 .ipynb_checkpoints/
-model/*.pkl
+# model/*.pkl
 data/raw/*.csv
 data/processed/*.csv
 app/*_backup.py
+app/*_backup.py
+data/processed/model_training_dataset.csv
+data/processed/*.csv
