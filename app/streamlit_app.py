@@ -1,3 +1,5 @@
+import os
+import joblib
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -456,6 +458,172 @@ def create_recommendations(portfolio_metrics, risk_contribution, market_level):
 
     return recommendations
 
+# ---------------------------------------------------------
+# Machine Learning Model Functions
+# ---------------------------------------------------------
+@st.cache_resource
+def load_ml_model():
+    """
+    Loads the trained machine learning risk model.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        model_path = os.path.join(base_dir, "model", "risk_model.pkl")
+
+        if not os.path.exists(model_path):
+            return None
+
+        model_package = joblib.load(model_path)
+        return model_package
+
+    except Exception as error:
+        st.warning(f"ML model could not be loaded: {error}")
+        return None
+
+
+def create_ml_features_for_latest_data(market_data, benchmark_data, model_features):
+    """
+    Creates the latest feature row for each selected ticker using the same feature logic
+    used during model training.
+    """
+    if market_data.empty or benchmark_data.empty:
+        return pd.DataFrame()
+
+    benchmark_features = pd.DataFrame()
+
+    for ticker in benchmark_data["Ticker"].unique():
+        temp = benchmark_data[benchmark_data["Ticker"] == ticker].copy()
+        temp = temp.sort_values("Date")
+
+        temp["daily_return"] = temp["Close"].pct_change()
+        temp["return_20d"] = temp["Close"].pct_change(20)
+        temp["volatility_20d"] = temp["daily_return"].rolling(20).std() * np.sqrt(252)
+        temp["vix_change_20d"] = temp["Close"].pct_change(20)
+
+        if ticker == "SPY":
+            selected = temp[["Date", "return_20d", "volatility_20d"]].copy()
+            selected = selected.rename(
+                columns={
+                    "return_20d": "spy_return_20d",
+                    "volatility_20d": "spy_volatility_20d"
+                }
+            )
+
+        elif ticker == "QQQ":
+            selected = temp[["Date", "return_20d"]].copy()
+            selected = selected.rename(columns={"return_20d": "qqq_return_20d"})
+
+        elif ticker == "^VIX":
+            selected = temp[["Date", "Close", "vix_change_20d"]].copy()
+            selected = selected.rename(columns={"Close": "vix_level"})
+
+        else:
+            continue
+
+        if benchmark_features.empty:
+            benchmark_features = selected
+        else:
+            benchmark_features = benchmark_features.merge(selected, on="Date", how="outer")
+
+    if benchmark_features.empty:
+        return pd.DataFrame()
+
+    benchmark_features = benchmark_features.sort_values("Date").ffill()
+
+    feature_rows = []
+
+    for ticker in market_data["Ticker"].unique():
+        temp = market_data[market_data["Ticker"] == ticker].copy()
+        temp = temp.sort_values("Date")
+
+        temp["daily_return"] = temp["Close"].pct_change()
+        temp["return_5d"] = temp["Close"].pct_change(5)
+        temp["return_20d"] = temp["Close"].pct_change(20)
+
+        temp["volatility_20d"] = temp["daily_return"].rolling(20).std() * np.sqrt(252)
+        temp["volatility_60d"] = temp["daily_return"].rolling(60).std() * np.sqrt(252)
+
+        temp["rolling_max_60d"] = temp["Close"].rolling(60).max()
+        temp["drawdown_60d"] = (temp["Close"] - temp["rolling_max_60d"]) / temp["rolling_max_60d"]
+        temp["max_drawdown_60d"] = temp["drawdown_60d"].rolling(60).min()
+
+        temp["ma_20"] = temp["Close"].rolling(20).mean()
+        temp["ma_50"] = temp["Close"].rolling(50).mean()
+
+        temp["ma_20_gap"] = (temp["Close"] - temp["ma_20"]) / temp["ma_20"]
+        temp["ma_50_gap"] = (temp["Close"] - temp["ma_50"]) / temp["ma_50"]
+
+        temp["volume_change_20d"] = temp["Volume"].pct_change(20)
+
+        temp = temp.merge(benchmark_features, on="Date", how="left")
+
+        temp = temp.replace([np.inf, -np.inf], np.nan)
+        temp = temp.dropna(subset=model_features)
+
+        if not temp.empty:
+            latest_row = temp.iloc[-1].copy()
+            feature_rows.append(latest_row)
+
+    if not feature_rows:
+        return pd.DataFrame()
+
+    latest_features = pd.DataFrame(feature_rows)
+
+    return latest_features
+
+
+def predict_ml_risk(model_package, latest_features, weights):
+    """
+    Generates stock-level and portfolio-level ML risk predictions.
+    """
+    if model_package is None or latest_features.empty:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    model = model_package["model"]
+    model_features = model_package["features"]
+
+    prediction_data = latest_features[["Date", "Ticker"] + model_features].copy()
+    X = prediction_data[model_features]
+
+    predicted_labels = model.predict(X)
+    probabilities = model.predict_proba(X)
+    class_labels = list(model.classes_)
+
+    prediction_data["Predicted Risk"] = predicted_labels
+    prediction_data["Confidence"] = probabilities.max(axis=1)
+
+    for index, label in enumerate(class_labels):
+        prediction_data[f"Probability - {label}"] = probabilities[:, index]
+
+    normalized_weights = normalize_weights(weights)
+    prediction_data["Weight"] = prediction_data["Ticker"].map(normalized_weights)
+
+    portfolio_probabilities = {}
+
+    for label in class_labels:
+        probability_column = f"Probability - {label}"
+        portfolio_probabilities[label] = (
+            prediction_data[probability_column] * prediction_data["Weight"]
+        ).sum()
+
+    portfolio_prediction = max(portfolio_probabilities, key=portfolio_probabilities.get)
+    portfolio_confidence = portfolio_probabilities[portfolio_prediction]
+
+    portfolio_result = {
+        "Portfolio ML Risk": portfolio_prediction,
+        "Portfolio ML Confidence": portfolio_confidence,
+        "Portfolio Probabilities": portfolio_probabilities
+    }
+
+    if hasattr(model, "feature_importances_"):
+        importance_df = pd.DataFrame({
+            "Feature": model_features,
+            "Importance": model.feature_importances_
+        }).sort_values("Importance", ascending=False)
+    else:
+        importance_df = pd.DataFrame()
+
+    return prediction_data, portfolio_result, importance_df
 
 # ---------------------------------------------------------
 # Sidebar Inputs
@@ -582,6 +750,28 @@ else:
     market_level = "Unavailable"
     market_reasons = ["Benchmark data is currently unavailable."]
 
+# ---------------------------------------------------------
+# Machine Learning Risk Prediction
+# ---------------------------------------------------------
+model_package = load_ml_model()
+
+if model_package is not None and not benchmark_data.empty:
+    ml_feature_data = create_ml_features_for_latest_data(
+        market_data=market_data,
+        benchmark_data=benchmark_data,
+        model_features=model_package["features"]
+    )
+
+    ml_predictions, portfolio_ml_result, feature_importance = predict_ml_risk(
+        model_package=model_package,
+        latest_features=ml_feature_data,
+        weights=weights
+    )
+else:
+    ml_feature_data = pd.DataFrame()
+    ml_predictions = pd.DataFrame()
+    portfolio_ml_result = None
+    feature_importance = pd.DataFrame()
 
 # ---------------------------------------------------------
 # Top KPI Section
@@ -616,6 +806,18 @@ with col7:
 with col8:
     metric_card("Market Signal", market_level)
 
+if portfolio_ml_result is not None:
+    col9, col10 = st.columns(2)
+
+    with col9:
+        metric_card("ML Portfolio Risk", portfolio_ml_result["Portfolio ML Risk"])
+
+    with col10:
+        metric_card(
+            "ML Confidence",
+            format_percent(portfolio_ml_result["Portfolio ML Confidence"])
+        )
+
 risk_message(risk_level, risk_score)
 
 if market_level != "Unavailable":
@@ -627,10 +829,11 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ---------------------------------------------------------
 # App Tabs
 # ---------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "Market Overview",
         "Portfolio Overview",
+        "ML Risk Model",
         "Risk Contributors",
         "Drawdown Analysis",
         "Stress Testing",
@@ -775,11 +978,125 @@ with tab2:
 
     st.dataframe(display_holdings, use_container_width=True)
 
-
 # ---------------------------------------------------------
-# Tab 3: Risk Contributors
+# Tab 3: ML Risk Model
 # ---------------------------------------------------------
 with tab3:
+    st.subheader("Machine Learning Risk Classification")
+
+    st.markdown(
+        """
+        This section uses a baseline Random Forest classification model trained on historical market behavior.
+        The model classifies current risk conditions as Low Risk, Medium Risk, or High Risk based on technical,
+        volatility, drawdown, volume, and benchmark market features.
+        """
+    )
+
+    if model_package is None:
+        st.warning("ML model file was not found. Please train the model first using model/train_risk_model.py.")
+
+    elif ml_predictions.empty or portfolio_ml_result is None:
+        st.warning("ML predictions could not be generated for the selected portfolio.")
+
+    else:
+        col_ml1, col_ml2, col_ml3 = st.columns(3)
+
+        with col_ml1:
+            metric_card("Portfolio ML Risk", portfolio_ml_result["Portfolio ML Risk"])
+
+        with col_ml2:
+            metric_card(
+                "ML Confidence",
+                format_percent(portfolio_ml_result["Portfolio ML Confidence"])
+            )
+
+        with col_ml3:
+            metric_card("Model Type", model_package["model_type"])
+
+        st.markdown("### Portfolio-Level Probability Breakdown")
+
+        probability_df = pd.DataFrame(
+            list(portfolio_ml_result["Portfolio Probabilities"].items()),
+            columns=["Risk Level", "Probability"]
+        )
+
+        fig_prob = px.bar(
+            probability_df,
+            x="Risk Level",
+            y="Probability",
+            text_auto=".2%",
+            title="Portfolio ML Risk Probability"
+        )
+        fig_prob.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig_prob, use_container_width=True)
+
+        st.markdown("### Stock-Level ML Risk Predictions")
+
+        display_ml = ml_predictions.copy()
+
+        columns_to_show = [
+            "Ticker",
+            "Weight",
+            "Predicted Risk",
+            "Confidence"
+        ]
+
+        probability_columns = [
+            col for col in display_ml.columns if col.startswith("Probability - ")
+        ]
+
+        display_ml = display_ml[columns_to_show + probability_columns].copy()
+
+        display_ml["Weight"] = display_ml["Weight"].map(format_percent)
+        display_ml["Confidence"] = display_ml["Confidence"].map(format_percent)
+
+        for col in probability_columns:
+            display_ml[col] = display_ml[col].map(format_percent)
+
+        st.dataframe(display_ml, use_container_width=True)
+
+        st.markdown("### Top Model Features")
+
+        if not feature_importance.empty:
+            top_features = feature_importance.head(10)
+
+            fig_importance = px.bar(
+                top_features.sort_values("Importance"),
+                x="Importance",
+                y="Feature",
+                orientation="h",
+                title="Top 10 Model Feature Importances"
+            )
+            st.plotly_chart(fig_importance, use_container_width=True)
+
+            st.dataframe(top_features, use_container_width=True)
+        else:
+            st.info("Feature importance is not available for this model.")
+
+        st.markdown("### Model Methodology")
+
+        st.write(
+            """
+            The model was trained using historical stock and benchmark data. 
+            The target label is based on future 5-day return behavior:
+            """
+        )
+
+        st.write("• **High Risk:** Future 5-day return is less than or equal to -3%.")
+        st.write("• **Medium Risk:** Future 5-day return is greater than -3% and less than or equal to +1%.")
+        st.write("• **Low Risk:** Future 5-day return is greater than +1%.")
+
+        st.info(
+            """
+            This is a baseline machine learning model for educational portfolio demonstration.
+            It should be interpreted as a risk classification support tool, not as financial advice or a trading signal.
+            """
+        )
+        
+# ---------------------------------------------------------
+# Tab 4: Risk Contributors
+# ---------------------------------------------------------
+with tab4:
     st.subheader("Weighted Volatility Contribution")
 
     st.markdown(
@@ -815,9 +1132,9 @@ with tab3:
 
 
 # ---------------------------------------------------------
-# Tab 4: Drawdown Analysis
+# Tab 5: Drawdown Analysis
 # ---------------------------------------------------------
-with tab4:
+with tab5:
     st.subheader("Historical Drawdown by Stock")
 
     st.markdown(
@@ -863,9 +1180,9 @@ with tab4:
 
 
 # ---------------------------------------------------------
-# Tab 5: Stress Testing
+# Tab 6: Stress Testing
 # ---------------------------------------------------------
-with tab5:
+with tab6:
     st.subheader("Portfolio Stress Test")
 
     st.markdown(
@@ -927,9 +1244,9 @@ with tab5:
 
 
 # ---------------------------------------------------------
-# Tab 6: Data & Downloads
+# Tab 7: Data & Downloads
 # ---------------------------------------------------------
-with tab6:
+with tab7:
     st.subheader("Raw Market Data Preview")
 
     st.markdown(
