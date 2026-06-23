@@ -33,7 +33,7 @@ The goal is to help users answer:
 Deployment link will be added after the Streamlit app is published.
 
 ```text
-Live App: Coming Soon
+[Launch Live App](https://real-time-investor-risk-intelligence.streamlit.app/)
 ```
 
 ## Tools and Technologies
