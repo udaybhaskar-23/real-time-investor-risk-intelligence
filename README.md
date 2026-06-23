@@ -30,11 +30,9 @@ The goal is to help users answer:
 
 ## Live App
 
-Deployment link will be added after the Streamlit app is published.
+The Streamlit app is deployed and available here:
 
-```text
 [Launch Live App](https://real-time-investor-risk-intelligence.streamlit.app/)
-```
 
 ## Tools and Technologies
 
