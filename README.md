@@ -273,6 +273,11 @@ model/risk_model.pkl
 model/model_features.json
 model/model_performance.csv
 ```
+## Wiki
+
+Detailed project Wiki is available here:
+
+[View Project Wiki](https://github.com/udaybhaskar-23/real-time-investor-risk-intelligence/wiki)
 
 ## Documentation
 
